@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<!--
+    wildfire.html
+    Aven Bross
+    17 Aug 2015
+
+    Uses webgl-ggc.js, J3DIMath.js
+-->
+<html style="overflow: hidden;">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>Wildfire Simulation</title>
+<style>
+#canvas-container {
+    position: absolute;
+    left: 180px;
+    top: 0px;
+    width: calc(100% - 200px);
+}
+#gui-container {
+    color: white;
+    position:absolute;
+    left: 20px;
+    top: 0px;
+    width: 180px;
+}
+canvas {
+   display: inline;
+}
+</style>
+</head>
+<body onload="appMain('can1')"
+    style="overflow: hidden; margin: 0; padding: 0; background-color: #000000;">
+    
+<div id="gui-container">
+<br/><label>Burn Chance</label><br/><input type="range" min="0" max="100" oninput="updateBurnChance(this.value)" onchange="updateBurnChance(this.value)">
+<br/><br/><label>Burn Time</label><br/><input type="range" min="0" max="100" oninput="updateBurnTime(this.value)" onchange="updateBurnTime(this.value)">
+<br/><br/><label>Height Factor</label><br/><input type="range" min="0" max="100" oninput="updateHeightFactor(this.value)" onchange="updateHeightFactor(this.value)">
+<br/><br/><label>Forest Size</label><br/><input type="range" min="0" max="100" oninput="updateForestSize(this.value)" onchange="updateForestSize(this.value)">
+</div>
+<div id="can1text"
+    style="position: absolute; left: 20px; top: 10px;"></div>
+<div id="canvas-container">
+<canvas id="can1" width="200" height="200"
+    style="margin: 0; padding: 0; border:1px solid #000000;"></canvas>
+</div>
+
+<script id="vshader1" type="x-shader/x-vertex">
+// Vertex Shader #1
+
+uniform mat4 modelViewMatrix;
+uniform mat4 projectionMatrix;
+
+attribute vec4 vertex_attr;
+attribute vec4 color_attr;
+
+varying vec4 color_var;
+varying vec3 ptobjcoords;
+
+void main()
+{
+    // Compute projected vertex position
+    gl_Position = projectionMatrix * modelViewMatrix * vertex_attr;
+
+    // Send color to fragment shader
+    color_var = color_attr;
+
+    // Send object coordinates to fragment shader
+    ptobjcoords = vertex_attr.xyz / vertex_attr.w;
+}
+</script>
+
+<script id="fshader1" type="x-shader/x-fragment">
+// Fragment Shader #1
+
+#ifdef GL_ES
+precision mediump float;
+#endif
+
+varying vec4 color_var;
+varying vec3 ptobjcoords;
+
+void main()
+{
+    // Set color
+    gl_FragColor = color_var;
+}
+</script>
+
+<script type="text/javascript" src="lib/J3DIMath.js"></script>
+<script type="text/javascript" src="lib/webgl-ggc.js"></script>
+<script type="text/javascript" src="lib/mersenne-twister.js"></script>
+<script type="text/javascript">
+// Application Code
+
+// Global variables
+
+// General
+var canvas;             // Our canvas
+var cwidth, cheight;    // Canvas width & height
+var gl;                 // WebGL context
+var redisplay_needed;   // True if redisplay needed
+
+// Shaders
+var prog1;              // Shader program object
+
+// Simulation parameters
+var tree_separation = 0.15;
+
+var totaltime = 0.0;
+var isClicked = false;
+
+var burn_time_min = 20.0;
+var burn_time_max = 60.0;
+var burn_time = 40.0;
+
+var burn_chance_min = 0.005;
+var burn_chance_max = 0.025;
+var burn_chance = 0.015;
+
+var height_factor_min = 1.0;
+var height_factor_max = 15.0;
+var height_factor = 7.5;
+
+var forest_size_min = 50;
+var forest_size_max = 150;
+
+var rng = new MersenneTwister();
+var forest = new Forest();
+
+
+// GUI Functions
+
+function updateBurnChance(percent){
+    burn_chance = burn_chance_min + (burn_chance_max-burn_chance_min)*(percent)/100;
+    redisplay_needed = true;
+}
+
+function updateBurnTime(percent){
+    burn_time = burn_time_min + (burn_time_max-burn_time_min)*(percent)/100;
+    var bt = forest.burned_trees;
+    for(var i=0; i<bt.length; i++){
+        if(bt[i][0]<forest_size && bt[i][1]<forest_size){
+            forest.trees[bt[i][0]][bt[i][1]].cut();
+        }
+    }
+    redisplay_needed = true;
+}
+
+function updateHeightFactor(percent){
+    height_factor = height_factor_min + (height_factor_max-height_factor_min)*(percent)/100;
+    redisplay_needed = true;
+}
+
+function updateForestSize(percent){
+    var forest_size = Math.floor(forest_size_min + (forest_size_max-forest_size_min)*percent/100);
+    tree_separation = (1-percent/100)*0.1 + 0.1;
+    forest.resize(forest_size,forest_size);
+    redisplay_needed = true;
+}
+
+
+// Simulation Classes
+
+// Tree class
+function Tree(height){
+    // Color
+    this.r = 0.;
+    this.g = 0.8;
+    this.b = 0.1;
+    
+    // Properties
+    this.state = 0;
+    this.height = height;
+    this.fire_threshold = 1.0;
+    
+    // Functions
+    this.advance = function(){
+        if(this.state < burn_time-1){
+            this.state += 1;
+            var fire_level = 2*((burn_time/2)-(this.state+2))/burn_time;
+            this.fire_threshold = 1.0 - fire_level*fire_level;
+            this.r = this.fire_threshold;
+            this.g = 0.0;
+            this.b = 0.1;
+        }
+        else{
+            this.state = burn_time;
+            this.r = 0.;
+            this.g = 0.;
+            this.b = 0.;
+        }
+        return false;
+    }
+    this.burn = function(tree){
+        if(this.state == 0){
+            var height_threshold = 1.0 + height_factor*(this.height-tree.height);
+            // Currently super complicated burn calculation
+            if(rng.random() < burn_chance * height_threshold * tree.fire_threshold){
+                this.state = 1;
+                this.r = 1.0;
+                this.g = 0.0;
+                this.b = 0.1;
+                return true;
+            }
+        }
+        return false;
+    }
+    this.cut = function() {
+        console.log("AHHH");
+        this.state = burn_time;
+        this.r = 0.;
+        this.g = 0.;
+        this.b = 0.;
+    }
+    this.light = function(){
+        if(this.state==0){
+            this.state = 1;
+            
+            var fire_level = 2*((burn_time/2)-(this.state+2))/burn_time;
+            this.fire_threshold = 1.0 - fire_level*fire_level;
+        
+            this.r = 1.0;
+            this.g = 0.0;
+            this.b = 0.1;
+        }
+    }
+}
+
+// Forest, contains array of trees and properties
+function Forest() {
+    // Properties
+    this.trees = [[]];
+    this.burning_trees = [];
+    this.burned_trees = [];
+    this.rows=0;
+    this.cols=0;
+    this.tree_size=0.0;
+    
+    // Functions
+    this.init = function(rows, cols){
+        this.rows=rows;
+        this.cols=cols;
+        if(rows>cols)
+            this.tree_size=22.0/rows;
+        else
+            this.tree_size=22.0/cols;
+        for(var i=0; i<rows; i++){
+            var row = [];
+            for(var j=0; j<cols; j++){
+                row[j]=new Tree(Math.abs((Math.sin(0.1*(i))+Math.cos(0.1*(j)))/2));
+            }
+            this.trees[i] = row;
+        }
+    }
+    this.resize = function(rows, cols){
+        var old_trees = this.trees;
+        var temp_burning = this.burning_trees;
+        var temp_burned = this.burned_trees;
+        var old_cols = this.cols;
+        var old_rows = this.rows;
+        
+        this.trees = [[]];
+        this.burning_trees = [];
+        this.burned_trees = [];
+        this.rows=rows;
+        this.cols=cols;
+        if(rows>cols)
+            this.tree_size=22.0/rows;
+        else
+            this.tree_size=22.0/cols;
+        for(var i=0; i<rows; i++){
+            var row = [];
+            for(var j=0; j<cols; j++){
+                if(j<old_cols && i<old_rows) row[j]=old_trees[i][j];
+                else row[j]=new Tree(Math.abs((Math.sin(0.1*(i))+Math.cos(0.1*(j)))/2));
+            }
+            this.trees[i] = row;
+        }
+        for(var i=0; i<temp_burning.length; i++){
+            if(temp_burning[i][0]<rows && temp_burning[i][1]<cols){
+                this.burning_trees.push(temp_burning[i]);
+            }
+        }
+        for(var i=0; i<temp_burned.length; i++){
+            if(temp_burned[i][0]<rows && temp_burned[i][1]<cols){
+                this.burned_trees.push(temp_burned[i]);
+            }
+        }
+    }
+    this.update = function(){
+        for(var i=0; i<this.burning_trees.length; i++){
+            var row = this.burning_trees[i][0];
+            var col = this.burning_trees[i][1];
+            var tree = this.trees[row][col];
+            tree.advance();
+            if(tree.state<=2) continue;
+            if(row<this.rows-1) if(this.trees[row+1][col].burn(tree)) this.burning_trees.push([row+1,col]);
+            if(row>0) if(this.trees[row-1][col].burn(tree)) this.burning_trees.push([row-1,col]);
+            if(col<this.cols-1) if(this.trees[row][col+1].burn(tree)) this.burning_trees.push([row,col+1]);
+            if(col>0) if(this.trees[row][col-1].burn(tree)) this.burning_trees.push([row,col-1]);
+            if(row<this.rows-1 && col<this.cols-1) if(this.trees[row+1][col+1].burn(tree)) this.burning_trees.push([row+1,col+1]);
+            if(row>0 && col>0) if(this.trees[row-1][col-1].burn(tree)) this.burning_trees.push([row-1,col-1]);
+            if(row<this.rows-1 && col>0) if(this.trees[row+1][col-1].burn(tree)) this.burning_trees.push([row+1,col-1]);
+            if(row>0 && col<this.cols-1) if(this.trees[row-1][col+1].burn(tree)) this.burning_trees.push([row-1,col+1]);
+            if(tree.state == burn_time){
+                this.burned_trees.push(this.burning_trees[i]);
+                this.burning_trees.splice(i,1);
+                i--;
+            }
+        }
+    }
+}
+
+
+// Drawing Functions
+
+// Draws the forest in one draw call with VBO
+function drawForest(ctx)
+{
+    // Get attribute locations
+    var attriblocs = getAttribLocs(ctx);
+    if (!attriblocs)
+    {
+        errOut(arguments.callee.name + ': ' +
+               'Could not get attribute locations');
+        return;
+    }
+
+    // Set up parameters
+    if (typeof r != 'number') r = 0.7;
+    if (typeof g != 'number') g = 0.7;
+    if (typeof b != 'number') b = 0.7;
+    if (typeof a != 'number') a = 1.0;
+
+    // Create VBOs
+    var buffs = new Array(5);
+    var datas = new Array(5);
+    var array_size = 6*forest.rows*forest.cols;
+    for (var i = 0; i < 5; ++i)
+    {
+        buffs[i] = ctx.createBuffer();
+        var components = (i == 2 || i == 4) ? 3 : 4;
+        datas[i] = new Float32Array(components*array_size);
+    }
+    var b4 = 0;
+    var b3 = 0;
+    var y = -11.0 + (forest.tree_size/2);
+    for(var row = 0; row<forest.rows; row++){
+        var x = -11.0 + (forest.tree_size/2);
+        for(var col = 0; col<forest.cols; col++){
+            var tree = forest.trees[row][col];
+            
+            for (var i = 0; i < 6; ++i)
+            {
+                var t_x = (i == 1 || i == 4 || i == 5) ? 0. : 1.;
+                var t_y = (i == 2 || i == 3 || i == 5) ? 0. : 1.;
+                
+                var height_frac = height_factor/height_factor_max;
+                var size = forest.tree_size-(tree_separation*(1-height_frac)+height_frac*tree_separation*(1-tree.height));
+                
+                // vertex coords
+                datas[0][b4+0] = x+(t_x-0.5) * size;
+                datas[0][b4+1] = y+(t_y-0.5) * size;
+                datas[0][b4+2] = 0.;
+                datas[0][b4+3] = 1.;
+
+                // color
+                datas[1][b4+0] = tree.r;
+                datas[1][b4+1] = tree.g;
+                datas[1][b4+2] = tree.b;
+                datas[1][b4+3] = 1.;
+
+                // normal
+                datas[2][b3+0] = 0.;
+                datas[2][b3+1] = 0.;
+                datas[2][b3+2] = 1.;
+
+                // texture coords
+                datas[3][b4+0] = x;
+                datas[3][b4+1] = y;
+                datas[3][b4+2] = 0.;
+                datas[3][b4+3] = 1.;
+
+                // tangent
+                datas[4][b3+0] = 1.;
+                datas[4][b3+1] = 0.;
+                datas[4][b3+2] = 0.;
+                
+                b4 += 4;
+                b3 += 3;
+            }
+            x += forest.tree_size;
+        }
+        y += forest.tree_size;
+    }
+    for (var i in attriblocs)
+    {
+        if (attriblocs[i] == -1)
+            continue;
+        var components = (i == 2 || i == 4) ? 3 : 4;
+        ctx.bindBuffer(ctx.ARRAY_BUFFER, buffs[i]);
+        ctx.bufferData(
+            ctx.ARRAY_BUFFER, datas[i], ctx.STATIC_DRAW);
+        ctx.vertexAttribPointer(
+            attriblocs[i], components, ctx.FLOAT, false, 0, 0);
+    }
+
+    // Set up uniforms, enable attributes
+    sendMatrices(ctx);
+    for (var i in attriblocs)
+        if (attriblocs[i] != -1)
+            ctx.enableVertexAttribArray(attriblocs[i]);
+
+    // Draw with VBO
+    ctx.drawArrays(ctx.TRIANGLES, 0, array_size);
+
+    // Disable attributes
+    for (var i in attriblocs)
+        if (attriblocs[i] != -1)
+            ctx.disableVertexAttribArray(attriblocs[i]);
+
+    // Delete buffer objects
+    for (i in buffs)
+        ctx.deleteBuffer(buffs[i]);
+}
+
+
+// WebGL Functions
+
+function myDisplay()
+{
+    gl.clearColor(0., 0., 0., 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    gl.useProgram(prog1);
+
+    //gl.enable(gl.DEPTH_TEST);  
+
+    gl.mvMatrix.makeIdentity();
+    gl.mvMatrix.translate(0., 0., -19.);
+    
+    pushMvMatrix(gl);
+    // Draw 
+    drawForest(gl);
+    popMvMatrix(gl);
+
+    gl.flush();
+}
+
+
+function myIdle()
+{
+    // Get elapsed time
+    var elapsedtime = getElapsedTime(0.1); // Param: max value to return
+    
+    totaltime += elapsedtime;
+    if(totaltime > 0.05 && forest.burning_trees.length>0){
+        forest.update();
+        redisplay_needed = true;
+        totaltime = 0.0;
+    }
+}
+
+
+function myReshape(w, h)
+{
+    // Set up viewport
+    gl.viewport(0, 0, w, h);
+
+    // Set up projection
+    gl.pMatrix.makeIdentity();
+    gl.pMatrix.perspective(60., w/h, 0.1, 20.0);
+}
+
+
+function myKeyboard(ch)
+{
+    // Note: Escape, arrows, etc. are handled inconsistently between
+    //  browsers. Alas! So we only deal with printable ASCII.
+    switch (ch)
+    {
+        case 'r':
+        case 'R':
+            var rows = forest.rows;
+            var cols = forest.cols;
+            forest = new Forest();
+            forest.init(rows,cols);
+            redisplay_needed = true;
+        default:
+            break;
+    }
+}
+
+
+function myMouseMove(x,y){
+    if(isClicked){
+        x += 11;
+        x /= forest.tree_size;
+        x = Math.floor(x);
+        y += 11;
+        y /= forest.tree_size;
+        y = Math.floor(y);
+        
+        // Record the tree as burning
+        var array = [];
+        array.push(y);
+        array.push(x);
+        if(forest.trees[y][x].state == 0) forest.burning_trees.push(array);
+        forest.trees[y][x].light();
+    }
+}
+
+
+function myMouseDown(x,y, right_click){
+    isClicked = true;
+    myMouseMove(x,y);
+}
+
+
+function myMouseUp(x,y){
+    isClicked = false;
+}
+
+
+function myRightClick(x,y){
+    forest.trees[y][x].cut();
+    for(var i=0; i<forest.burning_trees.length; i++){
+        if(forest.burning_trees[i][0] == y && forest.burning_trees[i][0] == x)
+            forest.burning_trees.splice(i,1);
+    }
+    redisplay_needed = true;
+}
+
+
+function init()
+{
+    // Objects
+    forest.init(100,100);
+
+    // Shaders
+    prog1 = makeProgramObjectFromIds(gl, 'vshader1', 'fshader1');
+}
+
+
+// Below is kind of a mini-GLUT
+//
+// Call appMain(canvasId) to start up the app (on document load?)
+//
+// These global variables should be declared:
+//     canvas           - Our canvas object
+//     cwidth           - Width of canvas (pixels)
+//     cheight          - Height of canvas (pixels)
+//     gl               - WebGL context
+//     redisplay_needed - Set to true to indicate redisplay needed
+//
+// These functions will be called as needed, if they exist:
+//     init
+//     myDisplay
+//     myReshape
+//     myIdle
+//     myKeyboard
+
+
+// doFrame
+// Should be called repeatedly. Calls myIdle and, if needed, myReshape,
+// myDisplay.
+function doFrame()
+{
+    // Idle
+    if (myIdle) myIdle();
+
+    // Reshape if necessary
+    if (canvas.width != cwidth || canvas.height != cheight)
+    {
+        cwidth = canvas.width;
+        cheight = canvas.height;
+        if (myReshape) myReshape(cwidth, cheight);
+        redisplay_needed=true;
+    }
+
+    // Display if necessary
+    if (redisplay_needed)
+    {
+        redisplay_needed = false;
+        if (myDisplay) myDisplay();
+    }
+}
+
+
+// sizeCanvas
+// Called on window resize events
+function sizeCanvas()  // Might be given an event argument; ignored
+{
+    var w = window.innerWidth-200;
+    var h = window.innerHeight
+    // Make our canvas fill the window
+    if(w>h){
+        canvas.width = h;
+        canvas.height = h;
+    }
+    else{
+        canvas.width = w;
+        canvas.height = w;
+    }
+}
+
+
+// doKeypress
+// Called on keypress event
+function doKeypress(evt)
+{
+    if (evt.charCode && myKeyboard)
+        myKeyboard(String.fromCharCode(evt.charCode));
+}
+
+// doMouseMove
+// Called on mousemove event
+function doMouseMove(evt){
+    var x = ((evt.clientX-180)/cwidth)*22-11;
+    var y = (evt.clientY/cheight)*(-22)+11;
+    if(myMouseMove) myMouseMove(x, y);
+}
+
+// doMouseDown
+// Called on click event
+function doMouseDown(evt){
+    var x = ((evt.clientX-180)/cwidth)*22-11;
+    var y = (evt.clientY/cheight)*(-22)+11;
+    if(myMouseDown) myMouseDown(x, y);
+}
+
+function doMouseUp(evt){
+    var x = ((evt.clientX-180)/cwidth)*22-11;
+    var y = (evt.clientY/cheight)*(-22)+11;
+    if(myMouseUp) myMouseUp(x, y);
+}
+
+function stopContext(evt){
+    evt.preventDefault();
+}
+
+// addEvent
+// Used to add an extra event to the resize event without overwriting
+var addEvent = function(elem, type, eventHandle) {
+    if (elem == null || typeof(elem) == 'undefined') return;
+    if ( elem.addEventListener ) {
+        elem.addEventListener( type, eventHandle, false );
+    } else if ( elem.attachEvent ) {
+        elem.attachEvent( "on" + type, eventHandle );
+    } else {
+        elem["on"+type]=eventHandle;
+    }
+}
+
+// appMain
+// Our "main" function
+function appMain(canvasId)
+{
+    // Initialize canvas, gl
+    canvas = getCanvas(canvasId);
+    gl = getGlContext(canvas);
+    if (!gl)
+        return;
+
+    // Application-specific initialization
+    if (init) init();
+
+    // Add event listeners
+    sizeCanvas();
+    addEvent(window, "resize", sizeCanvas);
+    document.addEventListener('keypress', doKeypress, false);
+    document.getElementById("can1").addEventListener('mousemove', doMouseMove, false);
+    document.getElementById("can1").addEventListener('mousedown', doMouseDown, false);
+    document.getElementById("can1").addEventListener('contextmenu', stopContext, false);
+    document.getElementById("can1").addEventListener('mouseup', doMouseUp, false);
+
+    // Do our main loop
+    redisplay_needed = true;
+    animate(doFrame);
+}
+</script>
+</body>
+</html>
